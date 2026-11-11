@@ -305,53 +305,43 @@ jobs:
           cat /tmp/foxgis.log
           test "$SUCCESS" -eq 1
 
-      - name: Upload platform packages
+      - name: Upload Windows x64
+        if: matrix.arch == 'x64'
         uses: actions/upload-artifact@v4
         with:
-          name: packages-${{ matrix.arch }}
-          path: release/*.tar.gz
-          if-no-files-found: error
-          retention-days: 30
-
-  
-  collect:
-    name: Collect four platform packages
-    needs: build
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Download all packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: packages-*
-          path: release
-          merge-multiple: true
-
-      - name: Verify four packages
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for platform in win linux macos linux-arm64; do
-            FILE="release/foxgis-server-lite-${platform}.tar.gz"
-
-            test -s "$FILE"
-            tar -tzf "$FILE" > /dev/null
-
-            echo "Verified: $FILE"
-          done
-
-          cd release
-          sha256sum *.tar.gz > SHA256SUMS
-          ls -lh
-
-      - name: Upload all artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: foxgis-server-lite-all-platforms
-          path: |
-            release/*.tar.gz
-            release/SHA256SUMS
+          name: foxgis-server-lite-win
+          path: release/foxgis-server-lite-win.tar.gz
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+      - name: Upload Linux x64
+        if: matrix.arch == 'x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxgis-server-lite-linux
+          path: release/foxgis-server-lite-linux.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload macOS x64
+        if: matrix.arch == 'x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxgis-server-lite-macos
+          path: release/foxgis-server-lite-macos.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload Linux ARM64
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxgis-server-lite-linux-arm64
+          path: release/foxgis-server-lite-linux-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
