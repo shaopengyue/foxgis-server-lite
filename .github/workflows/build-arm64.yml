@@ -1,0 +1,160 @@
+name: Build FoxGIS ARM64 Executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - "app/**"
+      - "bin/**"
+      - "package.json"
+      - "yarn.lock"
+      - ".github/workflows/build-arm64.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    name: Build Linux ARM64
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 make g++ libsqlite3-dev curl file
+
+      - name: Setup Yarn
+        run: |
+          corepack enable
+          yarn --version
+          node --version
+          uname -m
+
+      - name: Install dependencies
+        env:
+          HUSKY: "0"
+        run: |
+          yarn install --frozen-lockfile --non-interactive
+
+      - name: Install pkg 5.8.1
+        run: |
+          npm install -g pkg@5.8.1
+          pkg --version
+
+      - name: Verify sqlite3
+        run: |
+          node -e "
+          const sqlite3 = require('sqlite3');
+          const db = new sqlite3.Database(':memory:');
+          db.get('SELECT 1 AS value', (err, row) => {
+            if (err) {
+              console.error(err);
+              process.exitCode = 1;
+            } else {
+              console.log('sqlite3 OK:', row);
+            }
+            db.close();
+          });
+          "
+
+      - name: Configure pkg assets
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const pkg = JSON.parse(
+            fs.readFileSync('package.json', 'utf8')
+          );
+
+          pkg.pkg = pkg.pkg || {};
+          pkg.pkg.assets = [
+            ...new Set([
+              ...(pkg.pkg.assets || []),
+              "node_modules/**/*.node",
+              "node_modules/@mapbox/glyph-pbf-composite/proto/**/*.proto"
+            ])
+          ];
+
+          fs.writeFileSync(
+            'package.json',
+            JSON.stringify(pkg, null, 2) + '\n'
+          );
+          NODE
+
+      - name: Build ARM64 binary
+        run: |
+          mkdir -p dist
+
+          pkg . \
+            --targets node18-linux-arm64 \
+            --output dist/foxgis-server-lite-linux-arm64 \
+            --compress GZip
+
+          chmod +x dist/foxgis-server-lite-linux-arm64
+
+      - name: Inspect binary
+        run: |
+          file dist/foxgis-server-lite-linux-arm64
+          ls -lh dist/
+          sha256sum dist/foxgis-server-lite-linux-arm64 \
+            > dist/SHA256SUMS
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PORT=1234 ./dist/foxgis-server-lite-linux-arm64 \
+            > server.log 2>&1 &
+          PID=$!
+
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          SUCCESS=0
+
+          for i in $(seq 1 20); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "Server exited unexpectedly"
+              cat server.log
+              exit 1
+            fi
+
+            CODE=$(curl -s -o /dev/null \
+              -w "%{http_code}" \
+              http://127.0.0.1:1234/api || true)
+
+            if [[ "$CODE" =~ ^[1-5][0-9][0-9]$ ]]; then
+              echo "Server HTTP status: $CODE"
+              SUCCESS=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          cat server.log
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "Server did not respond"
+            exit 1
+          fi
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxgis-server-lite-linux-arm64
+          path: |
+            dist/foxgis-server-lite-linux-arm64
+            dist/SHA256SUMS
+          retention-days: 30
