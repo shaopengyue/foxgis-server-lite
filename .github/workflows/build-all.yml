@@ -1,0 +1,357 @@
+name: Build FoxGIS Executable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 make g++ curl file
+
+      - name: Setup Yarn and pkg
+        run: |
+          corepack enable
+          npm install -g pkg@5.8.1
+          node --version
+          yarn --version
+          pkg --version
+          uname -m
+
+      # 解决旧 sqlite3 的 ARM64 安装失败
+      - name: Fix sqlite3 version
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const p = JSON.parse(
+            fs.readFileSync('package.json', 'utf8')
+          );
+
+          p.resolutions = {
+            ...(p.resolutions || {}),
+            "**/sqlite3": "5.1.7"
+          };
+
+          fs.writeFileSync(
+            'package.json',
+            JSON.stringify(p, null, 2) + '\n'
+          );
+          NODE
+
+      - name: Install dependencies
+        env:
+          HUSKY: "0"
+        run: |
+          yarn install --non-interactive
+
+      - name: Verify sqlite3
+        run: |
+          node <<'NODE'
+          const sqlite3 = require('sqlite3');
+          const db = new sqlite3.Database(':memory:');
+          db.get('SELECT 1 AS value', (err, row) => {
+            if (err || !row || row.value !== 1) {
+              console.error(err || 'Invalid result');
+              process.exitCode = 1;
+            } else {
+              console.log('sqlite3 native module OK');
+            }
+            db.close();
+          });
+          NODE
+
+      - name: Run tests
+        run: yarn test
+
+      # 修复 pkg 环境下原生模块的加载位置
+      - name: Patch sqlite3 binding for pkg
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const bindingFile = require.resolve(
+            'sqlite3/lib/sqlite3-binding.js'
+          );
+
+          fs.writeFileSync(bindingFile, `
+          if (process.pkg) {
+            const path = require('path');
+            const nativeFile = path.join(
+              path.dirname(process.execPath),
+              'node_sqlite3.node'
+            );
+            module.exports = require(nativeFile);
+          } else {
+            module.exports =
+              require('bindings')('node_sqlite3.node');
+          }
+          `);
+
+          console.log('Patched:', bindingFile);
+          NODE
+
+      - name: Configure pkg assets
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const p = JSON.parse(
+            fs.readFileSync('package.json', 'utf8')
+          );
+
+          p.pkg = p.pkg || {};
+          p.pkg.assets = [
+            ...new Set([
+              ...(p.pkg.assets || []),
+              "node_modules/@mapbox/glyph-pbf-composite/proto/**/*.proto"
+            ])
+          ];
+
+          fs.writeFileSync(
+            'package.json',
+            JSON.stringify(p, null, 2) + '\n'
+          );
+          NODE
+
+      - name: Build x64 executables
+        if: matrix.arch == 'x64'
+        run: |
+          mkdir -p dist
+
+          pkg . \
+            --targets node18-win-x64,node18-linux-x64,node18-macos-x64 \
+            --out-path dist \
+            --no-bytecode \
+            --public \
+            --public-packages "*" \
+            --compress GZip
+
+      - name: Build ARM64 executable
+        if: matrix.arch == 'arm64'
+        run: |
+          mkdir -p dist
+
+          pkg . \
+            --targets node18-linux-arm64 \
+            --output dist/foxgis-server-lite-linux-arm64 \
+            --compress GZip
+
+      # 统一打包目录
+      - name: Package release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          package_one() {
+            local platform="$1"
+            local executable="$2"
+            local native="$3"
+
+            local name="foxgis-server-lite-${platform}"
+            local dir="release/${name}"
+
+            mkdir -p "$dir"
+            cp -a data "$dir/"
+            cp "$executable" "$dir/"
+            cp "$native" "$dir/node_sqlite3.node"
+
+            test -s "$dir/node_sqlite3.node"
+            test -d "$dir/data"
+            test -s "$dir/$(basename "$executable")"
+
+            (
+              cd release
+              tar -czf "${name}.tar.gz" "${name}"
+            )
+
+            rm -rf "$dir"
+            echo "Created: ${name}.tar.gz"
+          }
+
+          # 当前 Runner 架构的 sqlite3
+          NATIVE=$(find node_modules/sqlite3 \
+            -type f -name node_sqlite3.node \
+            -print -quit)
+
+          test -n "$NATIVE"
+          test -s "$NATIVE"
+
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            package_one \
+              linux-arm64 \
+              dist/foxgis-server-lite-linux-arm64 \
+              "$NATIVE"
+          else
+            # Linux x64：使用已安装的原生模块
+            package_one \
+              linux \
+              dist/foxgis-server-lite-linux \
+              "$NATIVE"
+
+            # Windows/macOS：下载对应平台的模块
+            BASE="https://github.com/TryGhost/node-sqlite3/releases/download/v5.1.7"
+
+            fetch_native() {
+              local platform="$1"
+              local dest="$2"
+              local archive="sqlite3-v5.1.7-napi-v3-${platform}.tar.gz"
+              local tmp
+              local found
+
+              tmp=$(mktemp -d)
+
+              curl -fL --retry 3 \
+                "${BASE}/${archive}" \
+                -o "${tmp}/native.tar.gz"
+
+              tar -xzf "${tmp}/native.tar.gz" \
+                -C "$tmp"
+
+              found=$(find "$tmp" \
+                -type f -name node_sqlite3.node \
+                -print -quit)
+
+              test -n "$found"
+              cp "$found" "$dest"
+              rm -rf "$tmp"
+            }
+
+            fetch_native win32-x64 /tmp/sqlite-win.node
+            fetch_native darwin-x64 /tmp/sqlite-macos.node
+
+            package_one \
+              win \
+              dist/foxgis-server-lite-win.exe \
+              /tmp/sqlite-win.node
+
+            package_one \
+              macos \
+              dist/foxgis-server-lite-macos \
+              /tmp/sqlite-macos.node
+          fi
+
+      # 对当前 Runner 能运行的平台做启动测试
+      - name: Smoke test Linux executable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            PLATFORM="linux-arm64"
+          else
+            PLATFORM="linux"
+          fi
+
+          NAME="foxgis-server-lite-${PLATFORM}"
+          mkdir -p /tmp/foxgis-smoke
+          tar -xzf "release/${NAME}.tar.gz" \
+            -C /tmp/foxgis-smoke
+
+          cd "/tmp/foxgis-smoke/${NAME}"
+          chmod +x "$NAME"
+
+          PORT=1234 "./${NAME}" > /tmp/foxgis.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          SUCCESS=0
+
+          for i in $(seq 1 20); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "Process exited"
+              cat /tmp/foxgis.log
+              exit 1
+            fi
+
+            CODE=$(curl -s -o /dev/null \
+              -w "%{http_code}" \
+              http://127.0.0.1:1234/api || true)
+
+            if [[ "$CODE" =~ ^[1-5][0-9][0-9]$ ]]; then
+              echo "HTTP status: $CODE"
+              SUCCESS=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          cat /tmp/foxgis.log
+          test "$SUCCESS" -eq 1
+
+      - name: Upload platform packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  
+  collect:
+    name: Collect four platform packages
+    needs: build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify four packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for platform in win linux macos linux-arm64; do
+            FILE="release/foxgis-server-lite-${platform}.tar.gz"
+
+            test -s "$FILE"
+            tar -tzf "$FILE" > /dev/null
+
+            echo "Verified: $FILE"
+          done
+
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS
+          ls -lh
+
+      - name: Upload all artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxgis-server-lite-all-platforms
+          path: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
