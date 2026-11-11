@@ -41,12 +41,48 @@ jobs:
           yarn --version
           node --version
           uname -m
+      
+      - name: Fix legacy sqlite3 dependency
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const pkg = JSON.parse(
+            fs.readFileSync('package.json', 'utf8')
+          );
+
+          pkg.resolutions = {
+            ...(pkg.resolutions || {}),
+            "**/sqlite3": "5.1.7"
+          };
+
+          fs.writeFileSync(
+            'package.json',
+            JSON.stringify(pkg, null, 2) + '\n'
+          );
+          NODE
 
       - name: Install dependencies
         env:
           HUSKY: "0"
         run: |
-          yarn install --frozen-lockfile --non-interactive
+          yarn install --non-interactive
+          yarn why sqlite3
+
+      - name: Verify sqlite3
+        run: |
+          node -e "
+          const sqlite3 = require('sqlite3');
+          const db = new sqlite3.Database(':memory:');
+          db.get('SELECT 1 AS value', (err, row) => {
+            if (err) {
+              console.error(err);
+              process.exitCode = 1;
+            } else {
+              console.log('sqlite3 OK:', row);
+            }
+            db.close();
+          });
+          "
 
       - name: Install pkg 5.8.1
         run: |
